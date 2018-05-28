@@ -8,8 +8,10 @@
 
 You can use the `cargo install` command:
 
-    $ cargo install mtproxy
-
+```bash
+$ rustup update
+$ cargo install mtproxy
+```
 or a classic build and run:
 
 ```bash
@@ -19,7 +21,19 @@ $ cargo build --release
 $ cp target/release/mtproxy ~/.bin # assuming .bin is in your path
 ```
 
-## Docker
+*Note*: `mtproxy` requires rust v1.26.0 or higher.
 
-* `docker run -p 1984:1984 -dti dotcypress/mtproxy -s 'proxy secret'`
-* `docker logs %container_id%`
+## Docker
+### Start proxy
+* `docker run --name 'mtproto_proxy' --restart unless-stopped -p 1984:1984 -dti dotcypress/mtproxy -s 'proxy secret'`
+
+'proxy secret' - is seed for generating secret, you should choose another word or generate random with `openssl rand -hex 15`
+
+### Get secret
+* `docker logs mtproto_proxy`
+
+### Stop proxy
+* `docker stop mtproto_proxy`
+
+### Remove proxy
+* `docker rm mtproto_proxy`

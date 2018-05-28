@@ -4,16 +4,18 @@ use std::{cell::RefCell, net::SocketAddr, usize};
 
 use crypto::{digest::Digest, sha2::Sha256};
 use mio::{net::TcpListener, unix::UnixReady, Events, Poll, PollOpt, Ready, Token};
+use pool::DcPool;
 use pump::Pump;
 use slab::Slab;
 
-const MAX_PUMPS: usize = 2048;
+const MAX_PUMPS: usize = 1024 * 1024;
 const ROOT_TOKEN: Token = Token(<usize>::max_value() - 1);
 
 pub struct Server {
   sock: TcpListener,
   poll: Poll,
   secret: Vec<u8>,
+  dc_pool: DcPool,
   pumps: Slab<RefCell<Pump>>,
   detached: HashSet<Token>,
   links: HashMap<Token, Token>,
@@ -30,6 +32,7 @@ impl Server {
 
     Server {
       secret,
+      dc_pool: DcPool::new(),
       detached: HashSet::new(),
       sock: TcpListener::bind(&addr).expect("Failed to bind"),
       poll: Poll::new().expect("Failed to create Poll"),
@@ -49,7 +52,7 @@ impl Server {
       .poll
       .register(&self.sock, ROOT_TOKEN, Ready::readable(), PollOpt::edge())?;
 
-    let mut events = Events::with_capacity(1024);
+    let mut events = Events::with_capacity(512);
 
     loop {
       self.poll.poll(&mut events, None)?;
@@ -59,7 +62,8 @@ impl Server {
         self.pumps.len(),
         self.links.len(),
         self.detached.len()
-      )
+      );
+      self.dc_pool.invalidate();
     }
   }
 
@@ -71,6 +75,7 @@ impl Server {
       let token = event.token();
 
       if token == ROOT_TOKEN {
+        trace!("accepting new connection");
         self.accept()?;
         continue;
       }
@@ -88,9 +93,13 @@ impl Server {
       if readiness.is_readable() {
         trace!("read event: {:?}", token);
         match pump.drain() {
-          Ok(Some(mut peer)) => {
+          Ok(Some(mut dc_idx)) => {
+            let sock = self.dc_pool.get(dc_idx)?;
+            let mut peer = Pump::new(sock);
             let buf = pump.pull();
-            peer.push(&buf);
+            if buf.len() > 0 {
+              peer.push(&buf);
+            }
             new_peers.insert(token, peer);
           }
           Ok(_) => {}
@@ -118,9 +127,12 @@ impl Server {
           }
         }
       }
-
-      if readiness.is_hup() || readiness.is_error() {
-        trace!("{:?}", event);
+      
+      if readiness.is_hup() {
+        trace!("hup event: {:?}", event.token());
+        stale.insert(token);
+      } else if readiness.is_error() {
+        trace!("error event {:?}", event.token());
         stale.insert(token);
       } else {
         self.poll.reregister(
@@ -139,6 +151,7 @@ impl Server {
       let peer_token = Token(idx);
       self.links.insert(peer_token, token);
       self.links.insert(token, peer_token);
+      info!("linked to dc: {:?} -> {:?}", token, peer_token);
 
       self.poll.register(
         peer_pump.sock(),
@@ -146,7 +159,6 @@ impl Server {
         peer_pump.interest(),
         PollOpt::edge() | PollOpt::oneshot(),
       )?;
-      info!("connected to dc: {:?} -> {:?}", token, peer_token);
     }
 
     for token in &self.detached {
@@ -178,7 +190,7 @@ impl Server {
       }
     };
 
-    let pump = Pump::new(sock, &self.secret);
+    let pump = Pump::from_secret(&self.secret, sock);
     let idx = self.pumps.insert(RefCell::new(pump));
     let pump = self.pumps.get(idx).unwrap().borrow();
 
@@ -190,12 +202,6 @@ impl Server {
       pump.interest(),
       PollOpt::edge() | PollOpt::oneshot(),
     )?;
-
-    info!(
-      "new connection: {:?} from {}",
-      token,
-      pump.sock().peer_addr()?
-    );
 
     Ok(())
   }
