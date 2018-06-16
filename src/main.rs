@@ -1,65 +1,92 @@
 #![deny(warnings)]
 
 #[macro_use]
-extern crate lazy_static;
-#[macro_use]
 extern crate log;
-
+#[macro_use]
+extern crate structopt;
 extern crate bytes;
-extern crate clap;
 extern crate crypto;
-extern crate env_logger;
 extern crate mio;
 extern crate rand;
+extern crate rustc_serialize;
+extern crate rustls;
 extern crate slab;
+extern crate stderrlog;
+extern crate webpki;
+extern crate webpki_roots;
 
-mod pool;
+mod config;
 mod proto;
 mod proxy;
 mod pump;
 
-use std::io;
+use std::{io, net::SocketAddr};
 
-use clap::{App, Arg};
+use config::Config;
 use proxy::Server;
+use rustc_serialize::hex::FromHex;
+use structopt::StructOpt;
 
-fn main() -> Result<(), io::Error> {
-  env_logger::init();
+#[derive(Debug, StructOpt)]
+struct Cli {
+  #[structopt(
+    short = "a", long = "addr", default_value = "0.0.0.0:1984", help = "Listening address."
+  )]
+  addr: SocketAddr,
 
-  let args = App::new("mtproxy")
-    .version(env!("CARGO_PKG_VERSION"))
-    .author("Vitaly Domnikov <dotcypress@gmail.com>")
-    .about("MTProto proxy server.")
-    .arg(
-      Arg::with_name("seed")
-        .value_name("SEED")
-        .short("s")
-        .long("seed")
-        .help("Proxy secret seed.")
-        .takes_value(true)
-        .required(true)
-        .display_order(0),
-    )
-    .arg(
-      Arg::with_name("addres")
-        .value_name("ADDRESS")
-        .short("a")
-        .long("addr")
-        .help("Listening address. Default value: 0.0.0.0:1984.")
-        .takes_value(true)
-        .display_order(1),
-    )
-    .get_matches();
+  #[structopt(long = "ipv6", help = "Use IPv6.")]
+  ipv6: bool,
 
-  let seed = args.value_of("seed").unwrap();
-  let addr = args.value_of("addres").unwrap_or("0.0.0.0:1984");
-  let addr = String::from(addr)
-    .parse()
-    .expect(&format!("Not supported address: {}", addr));
+  #[structopt(short = "s", long = "secret", help = "Proxy secret.")]
+  secret: String,
 
-  let mut serv = Server::new(addr, seed);
-  println!("Secret: {}\n", serv.secret());
-  println!("Ip:     {}", addr.ip());
-  println!("Port:   {}", addr.port());
-  serv.run()
+  #[structopt(long = "tag", help = "Proxy tag.")]
+  tag: Option<String>,
+
+  #[structopt(short = "v", long = "verbose", parse(from_occurrences))]
+  verbose: usize,
+
+  #[structopt(short = "q", long = "quiet", help = "Silence all output.")]
+  quiet: bool,
+}
+
+fn main() {
+  if let Err(err) = run() {
+    eprintln!("Error: {}", err)
+  }
+}
+
+fn run() -> Result<(), io::Error> {
+  let cli = Cli::from_args();
+
+  stderrlog::new()
+    .module(module_path!())
+    .quiet(cli.quiet)
+    .verbosity(cli.verbose)
+    .timestamp(stderrlog::Timestamp::Second)
+    .init()
+    .unwrap();
+
+  let secret = match cli.secret.from_hex() {
+    Ok(ref buf) if buf.len() == 16 => buf.to_vec(),
+    Ok(_) => {
+      return Err(io::Error::new(
+        io::ErrorKind::Other,
+        "Unsupported secret length",
+      ))
+    }
+    Err(_) => return Err(io::Error::new(io::ErrorKind::Other, "Mailformed secret")),
+  };
+
+  let tag = match cli.tag {
+    Some(tag) => match tag.from_hex() {
+      Ok(buf) => Some(buf.to_vec()),
+      Err(_) => return Err(io::Error::new(io::ErrorKind::Other, "Mailformed tag")),
+    },
+    None => None,
+  };
+
+  let config = Config::init(cli.addr, secret, tag, cli.ipv6)?;
+  let mut server = Server::new(config);
+  server.run()
 }

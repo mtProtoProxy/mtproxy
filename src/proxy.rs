@@ -1,49 +1,38 @@
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::io;
-use std::{cell::RefCell, net::SocketAddr, usize};
+use std::usize;
 
-use crypto::{digest::Digest, sha2::Sha256};
-use mio::{net::TcpListener, unix::UnixReady, Events, Poll, PollOpt, Ready, Token};
-use pool::DcPool;
+use config::Config;
+use mio::net::{TcpListener, TcpStream};
+use mio::unix::UnixReady;
+use mio::{Events, Poll, PollOpt, Ready, Token};
 use pump::Pump;
 use slab::Slab;
 
-const MAX_PUMPS: usize = 1024 * 1024;
+const MAX_PUMPS: usize = 256 * 1024;
 const ROOT_TOKEN: Token = Token(<usize>::max_value() - 1);
 
 pub struct Server {
+  config: Config,
   sock: TcpListener,
   poll: Poll,
-  secret: Vec<u8>,
-  dc_pool: DcPool,
   pumps: Slab<RefCell<Pump>>,
   detached: HashSet<Token>,
   links: HashMap<Token, Token>,
 }
 
 impl Server {
-  pub fn new(addr: SocketAddr, seed: &str) -> Server {
-    let mut sha = Sha256::new();
-    let mut secret = vec![0u8; sha.output_bytes()];
-
-    sha.input_str(seed);
-    sha.result(&mut secret);
-    secret.truncate(16);
-
+  pub fn new(config: Config) -> Server {
+    let sock = TcpListener::bind(&config.bind_addr()).expect("Failed to bind");
     Server {
-      secret,
-      dc_pool: DcPool::new(),
+      config,
+      sock,
       detached: HashSet::new(),
-      sock: TcpListener::bind(&addr).expect("Failed to bind"),
       poll: Poll::new().expect("Failed to create Poll"),
       pumps: Slab::with_capacity(MAX_PUMPS),
       links: HashMap::new(),
     }
-  }
-
-  pub fn secret(&self) -> String {
-    let secret: Vec<String> = self.secret.iter().map(|b| format!("{:02x}", b)).collect();
-    secret.join("")
   }
 
   pub fn run(&mut self) -> io::Result<()> {
@@ -63,7 +52,6 @@ impl Server {
         self.links.len(),
         self.detached.len()
       );
-      self.dc_pool.invalidate();
     }
   }
 
@@ -94,8 +82,14 @@ impl Server {
         trace!("read event: {:?}", token);
         match pump.drain() {
           Ok(Some(mut dc_idx)) => {
-            let sock = self.dc_pool.get(dc_idx)?;
-            let mut peer = Pump::new(sock);
+            let stream = match &self.config.dc_addr(dc_idx) {
+              Some(addr) => TcpStream::connect(addr)?,
+              None => {
+                warn!("failed to resolve dc address: {}", dc_idx);
+                continue;
+              }
+            };
+            let mut peer = Pump::downstream(&self.config.dc_secret(), stream);
             let buf = pump.pull();
             if buf.len() > 0 {
               peer.push(&buf);
@@ -190,7 +184,7 @@ impl Server {
       }
     };
 
-    let pump = Pump::from_secret(&self.secret, sock);
+    let pump = Pump::upstream(self.config.secret(), sock);
     let idx = self.pumps.insert(RefCell::new(pump));
     let pump = self.pumps.get(idx).unwrap().borrow();
 
